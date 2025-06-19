@@ -7,10 +7,9 @@ from difflib import SequenceMatcher
 import feedparser
 import requests
 import spotipy
-import torch
-import whisper
 from spotipy.oauth2 import SpotifyClientCredentials
 from dotenv import load_dotenv
+from huggingface_hub import InferenceClient
 
 
 def load_credentials():
@@ -25,6 +24,18 @@ def load_credentials():
             "or a .env file."
         )
     return client_id, client_secret
+
+
+def get_huggingface_client():
+    """Initializes and returns a Hugging Face Inference client."""
+    load_dotenv()
+    hf_token = os.getenv("HUGGING_FACE_API_TOKEN")
+    if not hf_token:
+        raise ValueError(
+            "Hugging Face token not found. "
+            "Please set HUGGING_FACE_API_TOKEN in your environment or a .env file."
+        )
+    return InferenceClient(token=hf_token)
 
 
 def get_spotify_client():
@@ -143,18 +154,22 @@ def download_audio(audio_url, filename, progress_callback=None):
     return filename
 
 
-def transcribe_audio(audio_file, model_size="base", progress_callback=None):
-    """Transcribe audio using Whisper."""
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    if device == "cuda":
-        torch.cuda.empty_cache()
+def transcribe_audio_hf(audio_file_path, hf_client, progress_callback=None):
+    """
+    Transcribes audio using the Hugging Face Inference API for ASR.
+    """
+    with open(audio_file_path, "rb") as f:
+        audio_data = f.read()
 
-    model = whisper.load_model(model_size, device=device)
-    result = model.transcribe(audio_file, verbose=False)
+    transcript = hf_client.automatic_speech_recognition(
+        audio_data,
+        model="openai/whisper-large-v3",
+    )
 
     if progress_callback:
         progress_callback(1.0)
-    return result["text"]
+        
+    return transcript['text']
 
 
 def sanitize_filename(name):
@@ -162,8 +177,8 @@ def sanitize_filename(name):
     return re.sub(r'[\\/*?:"<>|]', "", name)
 
 
-def get_transcript_from_url(spotify_url, model_size="base", status_callback=None, progress_callback=None):
-    """Full pipeline from Spotify URL to transcription."""
+def get_transcript_from_url(spotify_url, hf_client, status_callback=None, progress_callback=None):
+    """Full pipeline from Spotify URL to transcription using Hugging Face API."""
     
     def update_status(msg, progress=None):
         if status_callback:
@@ -192,8 +207,8 @@ def get_transcript_from_url(spotify_url, model_size="base", status_callback=None
         download_audio(audio_url, audio_file, progress_callback=lambda p: update_status("Downloading...", 0.4 + p * 0.3))
         
         update_status("Transcribing audio (this may take a while)...", 0.7)
-        transcription = transcribe_audio(
-            audio_file, model_size, progress_callback=lambda p: update_status("Transcribing...", 0.7 + p * 0.3)
+        transcription = transcribe_audio_hf(
+            audio_file, hf_client, progress_callback=lambda p: update_status("Transcribing...", 0.7 + p * 0.3)
         )
         
         update_status("Transcription complete!", 1.0)
@@ -202,3 +217,55 @@ def get_transcript_from_url(spotify_url, model_size="base", status_callback=None
     finally:
         os.remove(audio_file)
         update_status("Cleaning up temporary files.", 1.0)
+
+
+def summarize_text(text_to_summarize, hf_client, progress_callback=None):
+    """
+    Summarizes a long text by breaking it into chunks and using the Hugging Face API.
+    """
+    max_chunk_size = 1024  # Define a safe chunk size for the model
+    
+    # 1. Split text into manageable chunks (e.g., by paragraphs)
+    text_chunks = text_to_summarize.split('\n\n')
+    
+    summaries = []
+    num_chunks = len(text_chunks)
+    
+    for i, chunk in enumerate(text_chunks):
+        if not chunk.strip():
+            continue
+            
+        # 2. Summarize each chunk
+        try:
+            summary = hf_client.summarization(
+                chunk,
+                model="facebook/bart-large-cnn",
+                min_length=30,
+                max_length=150
+            )
+            summaries.append(summary[0]['summary_text'])
+        except Exception as e:
+            # Silently skip chunks that fail to summarize
+            print(f"Could not summarize chunk {i+1}/{num_chunks}: {e}")
+            continue
+
+        if progress_callback:
+            progress_callback( (i + 1) / num_chunks)
+
+    # 3. Combine summaries and provide a final summary if needed
+    combined_summary = "\n\n".join(summaries)
+    
+    # If the combined summary is still very long, do a final pass
+    if len(combined_summary.split()) > 400:
+        try:
+            final_summary = hf_client.summarization(
+                combined_summary,
+                model="facebook/bart-large-cnn",
+                min_length=50,
+                max_length=250
+            )
+            return final_summary[0]['summary_text']
+        except Exception:
+            return combined_summary # Return combined if final pass fails
+            
+    return combined_summary

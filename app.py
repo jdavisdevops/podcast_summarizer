@@ -57,18 +57,23 @@ st.markdown("""
 if 'sp_client' not in st.session_state:
     try:
         st.session_state.sp_client = co.get_spotify_client()
+        st.session_state.hf_client = co.get_huggingface_client()
     except Exception as e:
         st.session_state.sp_client = None
-        st.error(f"Could not connect to Spotify: {e}")
+        st.session_state.hf_client = None
+        st.error(f"Could not connect to API services: {e}")
 
 if 'transcription_result' not in st.session_state:
     st.session_state.transcription_result = None
+if 'summary_result' not in st.session_state:
+    st.session_state.summary_result = None
 if 'episode_to_transcribe' not in st.session_state:
     st.session_state.episode_to_transcribe = None
 
 # --- Helper Functions ---
-def transcribe_episode(url, model_size):
+def transcribe_episode(url):
     st.session_state.transcription_result = None
+    st.session_state.summary_result = None  # Reset summary
     progress_bar = st.progress(0)
     status_text = st.empty()
 
@@ -78,7 +83,7 @@ def transcribe_episode(url, model_size):
             progress_bar.progress(progress)
 
     try:
-        transcription, info = co.get_transcript_from_url(url, model_size, update_status, progress_bar.progress)
+        transcription, info = co.get_transcript_from_url(url, st.session_state.hf_client, update_status, progress_bar.progress)
         st.session_state.transcription_result = (info, transcription)
         status_text.empty()
         progress_bar.empty()
@@ -92,13 +97,6 @@ st.markdown('<h1 class="main-header">🎙️ Podcast Transcriber</h1>', unsafe_a
 
 # --- Sidebar ---
 with st.sidebar:
-    st.header("⚙️ Settings")
-    model_size = st.selectbox(
-        "Whisper Model",
-        ("base", "small", "medium"),
-        help="Select the Whisper model size. Larger models are more accurate but slower."
-    )
-
     st.header("🔗 Quick Links")
     st.markdown(
         """
@@ -110,7 +108,7 @@ with st.sidebar:
     )
 
     st.header("ℹ️ About")
-    st.info("This app uses Spotify and iTunes APIs to find and download podcast audio, then transcribes it using OpenAI's Whisper model.")
+    st.info("This app uses Spotify and iTunes APIs to find and download podcast audio, then transcribes and summarizes it using Hugging Face Inference APIs.")
 
 
 # --- Main Content ---
@@ -124,7 +122,7 @@ with tab1:
         submit_url = st.form_submit_button("Start Transcription", use_container_width=True)
 
     if submit_url and spotify_url:
-        transcribe_episode(spotify_url, model_size)
+        transcribe_episode(spotify_url)
 
 with tab2:
     if st.session_state.episode_to_transcribe:
@@ -141,7 +139,7 @@ with tab2:
 
         confirm_col, cancel_col, _ = st.columns([1,1,3])
         if confirm_col.button("✅ Yes, Transcribe", use_container_width=True):
-            transcribe_episode(item['external_urls']['spotify'], model_size)
+            transcribe_episode(item['external_urls']['spotify'])
             st.session_state.episode_to_transcribe = None
             st.experimental_rerun()
         if cancel_col.button("❌ Cancel", use_container_width=True):
@@ -185,17 +183,32 @@ if st.session_state.transcription_result:
     
     st.markdown(f'<div class="success-box"><b>Episode:</b> {info["episode_title"]}<br><b>Podcast:</b> {info["show_name"]}</div>', unsafe_allow_html=True)
 
-    safe_title = co.sanitize_filename(info["episode_title"])
-    filename = f"{safe_title}.txt"
+    col1, col2 = st.columns(2)
+
+    with col1:
+        safe_title = co.sanitize_filename(info["episode_title"])
+        filename = f"{safe_title}.txt"
+        st.download_button(
+            label="📥 Download Transcript",
+            data=transcription,
+            file_name=filename,
+            mime="text/plain",
+            use_container_width=True,
+            key=f"download_{safe_title}"
+        )
+
+    with col2:
+        if st.session_state.hf_client:
+            if st.button("📝 Generate Summary", use_container_width=True):
+                with st.spinner("Summarizing... This can take a few moments."):
+                    summary_progress = st.progress(0)
+                    summary = co.summarize_text(transcription, st.session_state.hf_client, summary_progress.progress)
+                    st.session_state.summary_result = summary
+                    summary_progress.empty()
     
-    st.download_button(
-        label="📥 Download Transcript",
-        data=transcription,
-        file_name=filename,
-        mime="text/plain",
-        use_container_width=True,
-        key=f"download_{safe_title}"
-    )
-    
-    with st.expander("📖 View Full Transcript", expanded=True):
-        st.text_area("Transcript", transcription, height=400) 
+    if st.session_state.summary_result:
+        st.subheader("📜 Summary")
+        st.markdown(st.session_state.summary_result)
+
+    with st.expander("📖 View Full Transcript", expanded=False):
+        st.text_area("Transcript", transcription, height=300) 
